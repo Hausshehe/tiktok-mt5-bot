@@ -1,6 +1,6 @@
 #property strict
-#property version   "0.1.1"
-#property description "Standalone XAUUSD demo EA: bounded adverse grid, basket target and risk limits."
+#property version   "0.1.2"
+#property description "Standalone XAUUSD demo EA: bounded adverse-move grid, basket target and risk limits."
 
 #include <Trade/Trade.mqh>
 
@@ -17,7 +17,7 @@ input double InpBasketLossMoney = 25.0;
 input int    InpFastMAPeriod = 9;
 input int    InpSlowMAPeriod = 21;
 input int    InpDeviationPoints = 30;
-input int    InpMaxSpreadPoints = 0; // 0 = disabled
+input int    InpMaxSpreadPoints = 100;
 
 int fast_ma_handle = INVALID_HANDLE;
 int slow_ma_handle = INVALID_HANDLE;
@@ -44,19 +44,6 @@ bool IsNewBar()
       return false;
    last_bar_time = times[0];
    return true;
-  }
-
-bool SpreadAllowed()
-  {
-   if(InpMaxSpreadPoints <= 0)
-      return true;
-
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(ask <= 0.0 || bid <= 0.0)
-      return false;
-
-   return ((ask - bid) / _Point <= InpMaxSpreadPoints);
   }
 
 int CountPositions(BasketDirection direction)
@@ -140,6 +127,20 @@ BasketDirection GetBasketDirection()
    return BASKET_NONE;
   }
 
+bool SpreadAllowed()
+  {
+   if(InpMaxSpreadPoints <= 0)
+      return true;
+
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(point <= 0.0 || ask <= 0.0 || bid <= 0.0)
+      return false;
+
+   return ((ask - bid) / point <= InpMaxSpreadPoints);
+  }
+
 bool CloseBasket()
   {
    bool ok = true;
@@ -172,15 +173,14 @@ bool ReadSignal(BasketDirection &signal)
   {
    signal = BASKET_NONE;
 
-   // Read only completed candles: shift 1 and shift 2.
+   // Completed candles only: shift 1 and shift 2.
    double fast[2], slow[2];
    if(CopyBuffer(fast_ma_handle, 0, 1, 2, fast) != 2)
       return false;
    if(CopyBuffer(slow_ma_handle, 0, 1, 2, slow) != 2)
       return false;
 
-   // CopyBuffer returns the older requested bar first here:
-   // [0] = shift 2, [1] = shift 1.
+   // CopyBuffer places the older requested value first: [0]=shift 2, [1]=shift 1.
    if(fast[0] <= slow[0] && fast[1] > slow[1])
       signal = BASKET_BUY;
    else if(fast[0] >= slow[0] && fast[1] < slow[1])
@@ -189,7 +189,7 @@ bool ReadSignal(BasketDirection &signal)
    return true;
   }
 
-bool LastEntryFarEnough(BasketDirection direction)
+bool AdverseGridDistanceReached(BasketDirection direction)
   {
    double last_price = 0.0;
    datetime latest = 0;
@@ -220,33 +220,33 @@ bool LastEntryFarEnough(BasketDirection direction)
    if(latest == 0)
       return true;
 
-   double market_price = (direction == BASKET_BUY)
-                       ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
-                       : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if(bid <= 0.0 || ask <= 0.0)
+      return false;
 
-   // Grid additions happen only when price moves AGAINST the basket.
    if(direction == BASKET_BUY)
-      return market_price <= last_price - InpGridStepPrice;
+      return bid <= last_price - InpGridStepPrice;
+   if(direction == BASKET_SELL)
+      return ask >= last_price + InpGridStepPrice;
 
-   return market_price >= last_price + InpGridStepPrice;
+   return false;
   }
 
-double NormalizeVolume(double volume)
+double NormalizeVolume(double requested)
   {
-   double min_volume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double max_volume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-
-   if(step <= 0.0)
+   if(min_lot <= 0.0 || max_lot <= 0.0 || step <= 0.0)
       return 0.0;
-   if(volume < min_volume || volume > max_volume)
-      return 0.0;
-
-   double normalized = MathFloor((volume + 1e-12) / step) * step;
-   if(normalized < min_volume || normalized > max_volume)
+   if(requested < min_lot || requested > max_lot)
       return 0.0;
 
-   return normalized;
+   double volume = MathFloor((requested + 1e-12) / step) * step;
+   if(volume < min_lot || volume > max_lot)
+      return 0.0;
+   return volume;
   }
 
 bool OpenPosition(BasketDirection direction)
@@ -261,13 +261,12 @@ bool OpenPosition(BasketDirection direction)
    double volume = NormalizeVolume(InpBaseLot);
    if(volume <= 0.0)
      {
-      Print("Configured base lot is incompatible with symbol volume limits/step.");
+      Print("Configured lot is incompatible with symbol volume limits/step.");
       return false;
      }
-
    if(ExposureLots() + volume > InpMaxExposureLots + 1e-9)
       return false;
-   if(!LastEntryFarEnough(direction))
+   if(!AdverseGridDistanceReached(direction))
       return false;
 
    trade.SetExpertMagicNumber(InpMagic);
@@ -282,7 +281,8 @@ bool OpenPosition(BasketDirection direction)
 
    if(!result ||
       (trade.ResultRetcode() != TRADE_RETCODE_DONE &&
-       trade.ResultRetcode() != TRADE_RETCODE_DONE_PARTIAL))
+       trade.ResultRetcode() != TRADE_RETCODE_DONE_PARTIAL &&
+       trade.ResultRetcode() != TRADE_RETCODE_PLACED))
      {
       PrintFormat("Entry failed/rejected: %s", trade.ResultRetcodeDescription());
       return false;
@@ -346,32 +346,21 @@ void OnTick()
    if(positions > 0)
      {
       double basket_profit = BasketProfit();
-
-      if(basket_profit >= InpBasketProfitMoney)
+      if(basket_profit >= InpBasketProfitMoney || basket_profit <= -InpBasketLossMoney)
         {
          CloseBasket();
          return;
         }
 
-      if(basket_profit <= -InpBasketLossMoney)
-        {
-         PrintFormat("Basket loss limit reached: %.2f", basket_profit);
-         CloseBasket();
-         return;
-        }
-
-      // Grid management is tick-driven and independent of the entry signal.
+      // Grid management is tick-driven. Add only after an adverse move.
       BasketDirection basket = GetBasketDirection();
       if(basket != BASKET_NONE)
          OpenPosition(basket);
-
       return;
      }
 
-   // A new basket is created only on a fresh bar and a completed-candle EMA cross.
-   if(!IsNewBar())
-      return;
-   if(!SpreadAllowed())
+   // New baskets are opened only on a new bar and a completed-candle EMA cross.
+   if(!IsNewBar() || !SpreadAllowed())
       return;
 
    BasketDirection signal;
